@@ -10,17 +10,16 @@ const mcgp = (n) => ethers.parseUnits(String(n), 18);
 const usdc = (n) => ethers.parseUnits(String(n), 6);
 const refOf = (s) => ethers.keccak256(ethers.toUtf8Bytes(s));
 
-describe("McgpEntitlementSwap (Swap Contract B)", function () {
+describe("McgpEntitlementSwap (Swap Contract B v2)", function () {
   let swap, mcgpToken, usdcToken;
-  let owner, alice, bob, merchant;
+  let owner, alice, bob, merchant, operator, guardian, attacker;
 
-  // Prices (USDC 6dp per 1 MCGP): premium buy $0.02, premium sell $0.018, legacy $0.01
   const PREMIUM_BUY_PRICE = 20000;
   const PREMIUM_SELL_PRICE = 18000;
   const LEGACY_SELL_PRICE = 10000;
 
   beforeEach(async function () {
-    [owner, alice, bob, merchant] = await ethers.getSigners();
+    [owner, alice, bob, merchant, operator, guardian, attacker] = await ethers.getSigners();
 
     const ERC20Mock = await ethers.getContractFactory("contracts/mocks/ERC20Mock.sol:ERC20Mock");
     mcgpToken = await ERC20Mock.deploy("MCGP Token", "MCGP", 18);
@@ -32,17 +31,16 @@ describe("McgpEntitlementSwap (Swap Contract B)", function () {
     swap = await Swap.deploy(owner.address, await mcgpToken.getAddress(), await usdcToken.getAddress());
     await swap.waitForDeployment();
 
-    // Configure phases (one phase each, active index 0).
     await swap.addPhase(PREMIUM_BUY, PREMIUM_BUY_PRICE, "premium buy");
     await swap.addPhase(PREMIUM_SELL, PREMIUM_SELL_PRICE, "premium sell");
     await swap.addPhase(LEGACY_SELL, LEGACY_SELL_PRICE, "legacy redeem");
+    await swap.addOperator(operator.address);
+    await swap.addGuardian(guardian.address);
 
-    // Seed balances.
     await mcgpToken.mint(owner.address, mcgp(10_000_000));
     await usdcToken.mint(owner.address, usdc(10_000_000));
     await usdcToken.mint(alice.address, usdc(1_000_000));
-    await usdcToken.mint(bob.address, usdc(1_000_000));
-    await mcgpToken.mint(alice.address, mcgp(100_000)); // alice holds legacy MCGP in wallet
+    await mcgpToken.mint(alice.address, mcgp(100_000));
   });
 
   async function fundMcgp(amount) {
@@ -54,10 +52,14 @@ describe("McgpEntitlementSwap (Swap Contract B)", function () {
     await swap.fund(await usdcToken.getAddress(), amount);
   }
 
-  // Invariant: accountedMcgp == Σ premiumBalance, and held MCGP >= accountedMcgp.
+  // Invariant: accountedMcgp == Σ(bought+credited+pendingSettle) and held >= accounted.
   async function assertBacking(users) {
     let sum = 0n;
-    for (const u of users) sum += await swap.premiumBalance(u.address);
+    for (const u of users) {
+      sum += await swap.premiumBought(u.address);
+      sum += await swap.premiumCredited(u.address);
+      sum += await swap.pendingSettle(u.address);
+    }
     const accounted = await swap.accountedMcgp();
     expect(accounted).to.equal(sum);
     const [held, owed] = await swap.backing();
@@ -65,181 +67,194 @@ describe("McgpEntitlementSwap (Swap Contract B)", function () {
     expect(held).to.be.gte(owed);
   }
 
+  const ALL = () => [alice, bob, merchant, operator, attacker, owner];
+
   describe("Deployment", function () {
-    it("sets tokens and owner", async function () {
+    it("sets tokens, owner, operator, guardian", async function () {
       expect(await swap.mcgpToken()).to.equal(await mcgpToken.getAddress());
-      expect(await swap.usdcToken()).to.equal(await usdcToken.getAddress());
       expect(await swap.owner()).to.equal(owner.address);
-    });
-    it("quotes per the active phase", async function () {
-      expect(await swap.quote(PREMIUM_BUY, mcgp(100))).to.equal(usdc(2)); // 100 * 0.02
-      expect(await swap.quote(LEGACY_SELL, mcgp(100))).to.equal(usdc(1)); // 100 * 0.01
+      expect(await swap.operators(operator.address)).to.equal(true);
+      expect(await swap.guardians(guardian.address)).to.equal(true);
     });
   });
 
-  describe("Premium buy / backing", function () {
-    it("credits premium balance, raises accountedMcgp, requires backing", async function () {
+  describe("Premium buy (bought = self-exitable)", function () {
+    it("credits premiumBought and is backed", async function () {
       await fundMcgp(mcgp(1000));
-      const amount = mcgp(500);
-      const cost = await swap.quote(PREMIUM_BUY, amount); // $10
+      const cost = await swap.quote(PREMIUM_BUY, mcgp(500));
       await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
-      await expect(swap.connect(alice).buyPremium(amount, cost))
-        .to.emit(swap, "PremiumBought").withArgs(alice.address, amount, cost);
-      expect(await swap.premiumBalance(alice.address)).to.equal(amount);
-      expect(await swap.accountedMcgp()).to.equal(amount);
-      await assertBacking([alice, bob, merchant]);
+      await swap.connect(alice).buyPremium(mcgp(500), cost);
+      expect(await swap.premiumBought(alice.address)).to.equal(mcgp(500));
+      expect(await swap.premiumBalanceOf(alice.address)).to.equal(mcgp(500));
+      await assertBacking(ALL());
     });
-
-    it("reverts when underbacked (MCGP not funded)", async function () {
-      const amount = mcgp(500);
-      const cost = await swap.quote(PREMIUM_BUY, amount);
+    it("reverts when underbacked", async function () {
+      const cost = await swap.quote(PREMIUM_BUY, mcgp(500));
       await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
-      await expect(swap.connect(alice).buyPremium(amount, cost))
+      await expect(swap.connect(alice).buyPremium(mcgp(500), cost)).to.be.revertedWith("Underbacked: fund MCGP first");
+    });
+  });
+
+  describe("Operator credit (premiumCredited = spend-only)", function () {
+    beforeEach(async function () {
+      await fundMcgp(mcgp(10_000));
+    });
+    it("credits premiumCredited, raises accounted, requires backing", async function () {
+      await expect(swap.connect(operator).creditPremium(alice.address, mcgp(500), refOf("IT:credit:1")))
+        .to.emit(swap, "PremiumCredited").withArgs(alice.address, mcgp(500), refOf("IT:credit:1"));
+      expect(await swap.premiumCredited(alice.address)).to.equal(mcgp(500));
+      expect(await swap.premiumBought(alice.address)).to.equal(0);
+      await assertBacking(ALL());
+    });
+    it("reverts when not operator", async function () {
+      await expect(swap.connect(alice).creditPremium(alice.address, mcgp(1), refOf("x"))).to.be.revertedWith("Not operator");
+    });
+    it("reverts on reused ref", async function () {
+      await swap.connect(operator).creditPremium(alice.address, mcgp(1), refOf("r"));
+      await expect(swap.connect(operator).creditPremium(alice.address, mcgp(1), refOf("r"))).to.be.revertedWith("Ref already used");
+    });
+    it("reverts when credit would exceed backing", async function () {
+      await expect(swap.connect(operator).creditPremium(alice.address, mcgp(20_000), refOf("big")))
         .to.be.revertedWith("Underbacked: fund MCGP first");
     });
-
-    it("enforces slippage on buy", async function () {
-      await fundMcgp(mcgp(1000));
-      const amount = mcgp(500);
-      const cost = await swap.quote(PREMIUM_BUY, amount);
-      await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
-      await expect(swap.connect(alice).buyPremium(amount, cost - 1n))
-        .to.be.revertedWith("Slippage exceeded");
+    it("enforces minCredit / per-tx / rolling window caps", async function () {
+      await swap.setCreditCaps(mcgp(10), mcgp(1000), 3600, mcgp(1500));
+      await expect(swap.connect(operator).creditPremium(alice.address, mcgp(5), refOf("c1"))).to.be.revertedWith("Below min credit");
+      await expect(swap.connect(operator).creditPremium(alice.address, mcgp(1001), refOf("c2"))).to.be.revertedWith("Over per-tx cap");
+      await swap.connect(operator).creditPremium(alice.address, mcgp(1000), refOf("c3"));
+      await expect(swap.connect(operator).creditPremium(alice.address, mcgp(600), refOf("c4"))).to.be.revertedWith("Over window cap");
     });
   });
 
-  describe("Spend (premium, user-signed, idempotent)", function () {
+  describe("C1 regression — credited premium is NOT self-exitable", function () {
     beforeEach(async function () {
-      await fundMcgp(mcgp(1000));
-      const cost = await swap.quote(PREMIUM_BUY, mcgp(500));
-      await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
-      await swap.connect(alice).buyPremium(mcgp(500), cost);
-    });
-
-    it("moves premium between wallets and keeps accountedMcgp constant", async function () {
-      const before = await swap.accountedMcgp();
-      await expect(swap.connect(alice).spend(merchant.address, mcgp(120), refOf("order-1")))
-        .to.emit(swap, "PremiumSpent").withArgs(alice.address, merchant.address, mcgp(120), refOf("order-1"));
-      expect(await swap.premiumBalance(alice.address)).to.equal(mcgp(380));
-      expect(await swap.premiumBalance(merchant.address)).to.equal(mcgp(120));
-      expect(await swap.accountedMcgp()).to.equal(before);
-      await assertBacking([alice, bob, merchant]);
-    });
-
-    it("rejects a reused ref (idempotency)", async function () {
-      await swap.connect(alice).spend(merchant.address, mcgp(10), refOf("order-2"));
-      await expect(swap.connect(alice).spend(merchant.address, mcgp(10), refOf("order-2")))
-        .to.be.revertedWith("Ref already used");
-    });
-
-    it("rejects spend beyond balance / to self / zero ref", async function () {
-      await expect(swap.connect(alice).spend(merchant.address, mcgp(10_000), refOf("x")))
-        .to.be.revertedWith("Insufficient premium balance");
-      await expect(swap.connect(alice).spend(alice.address, mcgp(1), refOf("y")))
-        .to.be.revertedWith("Cannot spend to self");
-      await expect(swap.connect(alice).spend(merchant.address, mcgp(1), ethers.ZeroHash))
-        .to.be.revertedWith("Invalid ref");
-    });
-  });
-
-  describe("Premium sell / withdraw", function () {
-    beforeEach(async function () {
-      await fundMcgp(mcgp(1000));
+      await fundMcgp(mcgp(10_000));
       await fundUsdc(usdc(100_000));
-      const cost = await swap.quote(PREMIUM_BUY, mcgp(500));
-      await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
-      await swap.connect(alice).buyPremium(mcgp(500), cost);
+      // Compromised-operator scenario: credit an attacker-controlled wallet.
+      await swap.connect(operator).creditPremium(attacker.address, mcgp(1000), refOf("IT:credit:atk"));
     });
-
-    it("sells premium for USDC at the premium sell price and lowers accountedMcgp", async function () {
-      const proceeds = await swap.quote(PREMIUM_SELL, mcgp(200)); // 200 * 0.018 = $3.6
-      const balBefore = await usdcToken.balanceOf(alice.address);
-      await expect(swap.connect(alice).sellPremium(mcgp(200), proceeds))
-        .to.emit(swap, "PremiumSold");
-      expect(await swap.premiumBalance(alice.address)).to.equal(mcgp(300));
-      expect(await swap.accountedMcgp()).to.equal(mcgp(300));
-      expect(await usdcToken.balanceOf(alice.address)).to.equal(balBefore + proceeds);
-      await assertBacking([alice, bob, merchant]);
+    it("attacker cannot withdraw credited premium as MCGP", async function () {
+      await expect(swap.connect(attacker).withdrawPremiumToWallet(mcgp(1))).to.be.revertedWith("Insufficient bought premium");
     });
-
-    it("withdraws premium to wallet as real MCGP (even when paused)", async function () {
-      await swap.pause();
-      const walBefore = await mcgpToken.balanceOf(alice.address);
-      await expect(swap.connect(alice).withdrawPremiumToWallet(mcgp(100)))
-        .to.emit(swap, "PremiumWithdrawn").withArgs(alice.address, mcgp(100));
-      expect(await swap.premiumBalance(alice.address)).to.equal(mcgp(400));
-      expect(await swap.accountedMcgp()).to.equal(mcgp(400));
-      expect(await mcgpToken.balanceOf(alice.address)).to.equal(walBefore + mcgp(100));
-      await assertBacking([alice, bob, merchant]);
+    it("attacker cannot sell credited premium for USDC", async function () {
+      await expect(swap.connect(attacker).sellPremium(mcgp(1), 0)).to.be.revertedWith("Insufficient bought premium");
+    });
+    it("spending credited premium keeps it credited (non-exitable) for the recipient", async function () {
+      await swap.connect(attacker).spend(bob.address, mcgp(100), refOf("spend:atk"));
+      expect(await swap.premiumCredited(bob.address)).to.equal(mcgp(100));
+      expect(await swap.premiumBought(bob.address)).to.equal(0);
+      await expect(swap.connect(bob).withdrawPremiumToWallet(mcgp(1))).to.be.revertedWith("Insufficient bought premium");
+      await assertBacking(ALL());
     });
   });
 
-  describe("Legacy (redeem-only, capped at snapshot)", function () {
+  describe("Spend provenance (credited-first)", function () {
+    it("debits credited before bought; recipient gets matching buckets", async function () {
+      await fundMcgp(mcgp(10_000));
+      const cost = await swap.quote(PREMIUM_BUY, mcgp(300));
+      await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
+      await swap.connect(alice).buyPremium(mcgp(300), cost);                 // bought 300
+      await swap.connect(operator).creditPremium(alice.address, mcgp(200), refOf("IT:credit:a")); // credited 200
+      await swap.connect(alice).spend(merchant.address, mcgp(250), refOf("spend:1"));             // 200 credited + 50 bought
+      expect(await swap.premiumCredited(alice.address)).to.equal(0);
+      expect(await swap.premiumBought(alice.address)).to.equal(mcgp(250));
+      expect(await swap.premiumCredited(merchant.address)).to.equal(mcgp(200));
+      expect(await swap.premiumBought(merchant.address)).to.equal(mcgp(50));
+      await assertBacking(ALL());
+    });
+  });
+
+  describe("Two-phase debit (C2 — no withdrawable excess until settled)", function () {
     beforeEach(async function () {
+      // Fund EXACTLY the credited amount so excess starts at 0 and the test
+      // isolates the pendingSettle effect (no unrelated over-funded excess).
+      await fundMcgp(mcgp(1000));
+      await swap.connect(operator).creditPremium(alice.address, mcgp(1000), refOf("IT:credit:s"));
+    });
+    it("debit moves to pendingSettle without freeing backing", async function () {
+      const accBefore = await swap.accountedMcgp();
+      await swap.connect(operator).debitPremium(alice.address, mcgp(400), refOf("IT:debit:1"));
+      expect(await swap.premiumCredited(alice.address)).to.equal(mcgp(600));
+      expect(await swap.pendingSettle(alice.address)).to.equal(mcgp(400));
+      expect(await swap.accountedMcgp()).to.equal(accBefore); // unchanged → no new excess
+      // owner cannot withdraw the pending-settle MCGP as "excess"
+      await expect(swap.withdraw(await mcgpToken.getAddress(), owner.address, mcgp(1)))
+        .to.be.revertedWith("Exceeds withdrawable MCGP excess");
+      await assertBacking(ALL());
+    });
+    it("settleDebit frees backing after payout success", async function () {
+      await swap.connect(operator).debitPremium(alice.address, mcgp(400), refOf("IT:debit:2"));
+      await swap.connect(operator).settleDebit(refOf("IT:debit:2"));
+      expect(await swap.pendingSettle(alice.address)).to.equal(0);
+      await expect(swap.withdraw(await mcgpToken.getAddress(), owner.address, mcgp(400))).to.emit(swap, "Withdrawn");
+      await assertBacking(ALL());
+    });
+    it("reverseDebit restores credited on payout failure", async function () {
+      await swap.connect(operator).debitPremium(alice.address, mcgp(400), refOf("IT:debit:3"));
+      await swap.connect(operator).reverseDebit(refOf("IT:debit:3"));
+      expect(await swap.premiumCredited(alice.address)).to.equal(mcgp(1000));
+      expect(await swap.pendingSettle(alice.address)).to.equal(0);
+      await assertBacking(ALL());
+    });
+    it("a debit resolves at most once: no double-settle, no settle-then-reverse", async function () {
+      await swap.connect(operator).debitPremium(alice.address, mcgp(400), refOf("IT:debit:4"));
+      await swap.connect(operator).settleDebit(refOf("IT:debit:4"));
+      await expect(swap.connect(operator).settleDebit(refOf("IT:debit:4"))).to.be.revertedWith("Not pending");
+      await expect(swap.connect(operator).reverseDebit(refOf("IT:debit:4"))).to.be.revertedWith("Not pending");
+    });
+    it("duplicate debit ref is rejected", async function () {
+      await swap.connect(operator).debitPremium(alice.address, mcgp(100), refOf("IT:debit:dup"));
+      await expect(swap.connect(operator).debitPremium(alice.address, mcgp(100), refOf("IT:debit:dup"))).to.be.revertedWith("Debit exists");
+    });
+    it("settleDebit is blocked while paused; reverseDebit is not", async function () {
+      await swap.connect(operator).debitPremium(alice.address, mcgp(100), refOf("IT:debit:5"));
+      await swap.connect(operator).debitPremium(alice.address, mcgp(100), refOf("IT:debit:6"));
+      await swap.pause();
+      await expect(swap.connect(operator).settleDebit(refOf("IT:debit:5"))).to.be.revertedWithCustomError(swap, "EnforcedPause");
+      await expect(swap.connect(operator).reverseDebit(refOf("IT:debit:6"))).to.emit(swap, "PremiumDebitReversed");
+    });
+  });
+
+  describe("Legacy redeem-only (unchanged)", function () {
+    it("redeems up to entitlement, blocks beyond", async function () {
       await fundUsdc(usdc(100_000));
       await swap.seedLegacy([alice.address], [mcgp(1000)]);
-    });
-
-    it("redeems legacy MCGP for USDC at the legacy price, up to entitlement", async function () {
-      const proceeds = await swap.quote(LEGACY_SELL, mcgp(400)); // $4
-      await mcgpToken.connect(alice).approve(await swap.getAddress(), mcgp(400));
-      const usdcBefore = await usdcToken.balanceOf(alice.address);
-      await expect(swap.connect(alice).sellLegacy(mcgp(400), proceeds))
-        .to.emit(swap, "LegacyRedeemed").withArgs(alice.address, mcgp(400), proceeds);
-      expect(await swap.legacyRedeemed(alice.address)).to.equal(mcgp(400));
-      expect(await swap.legacyRemaining(alice.address)).to.equal(mcgp(600));
-      expect(await usdcToken.balanceOf(alice.address)).to.equal(usdcBefore + proceeds);
-      // Legacy redemption must NOT touch premium backing.
-      expect(await swap.accountedMcgp()).to.equal(0);
-    });
-
-    it("reverts when redeeming beyond entitlement", async function () {
       await mcgpToken.connect(alice).approve(await swap.getAddress(), mcgp(2000));
-      await expect(swap.connect(alice).sellLegacy(mcgp(1001), 0))
-        .to.be.revertedWith("Exceeds legacy entitlement");
-    });
-
-    it("a non-seeded user has zero entitlement and cannot redeem", async function () {
-      await mcgpToken.mint(bob.address, mcgp(100));
-      await mcgpToken.connect(bob).approve(await swap.getAddress(), mcgp(100));
-      await expect(swap.connect(bob).sellLegacy(mcgp(1), 0))
-        .to.be.revertedWith("Exceeds legacy entitlement");
+      await swap.connect(alice).sellLegacy(mcgp(400), 0);
+      expect(await swap.legacyRemaining(alice.address)).to.equal(mcgp(600));
+      await expect(swap.connect(alice).sellLegacy(mcgp(601), 0)).to.be.revertedWith("Exceeds legacy entitlement");
+      expect(await swap.accountedMcgp()).to.equal(0); // legacy never touches premium backing
     });
   });
 
-  describe("Admin withdraw (MCGP excess only, USDC free)", function () {
-    it("blocks withdrawing user-owed premium MCGP; allows true excess", async function () {
+  describe("Guardian + pause", function () {
+    it("guardian can pause and removeOperator, but not addOperator", async function () {
+      await swap.connect(guardian).pause();
       await fundMcgp(mcgp(1000));
-      const cost = await swap.quote(PREMIUM_BUY, mcgp(500));
-      await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
-      await swap.connect(alice).buyPremium(mcgp(500), cost);
-      // held = 1000, owed = 500 -> excess = 500.
-      await expect(swap.withdraw(await mcgpToken.getAddress(), owner.address, mcgp(501)))
-        .to.be.revertedWith("Exceeds withdrawable MCGP excess");
-      await expect(swap.withdraw(await mcgpToken.getAddress(), owner.address, mcgp(500)))
-        .to.emit(swap, "Withdrawn");
-      await assertBacking([alice, bob, merchant]);
+      await expect(swap.connect(operator).creditPremium(alice.address, mcgp(1), refOf("p"))).to.be.revertedWithCustomError(swap, "EnforcedPause");
+      await swap.connect(guardian).removeOperator(operator.address);
+      expect(await swap.operators(operator.address)).to.equal(false);
+      await expect(swap.connect(guardian).addOperator(bob.address)).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
+      // guardian can stop, but only the owner can restart
+      await expect(swap.connect(guardian).unpause()).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
+      await swap.unpause();
     });
-  });
-
-  describe("Pause + access control", function () {
-    it("pause blocks buy/spend/sell/legacy but never withdrawPremiumToWallet", async function () {
+    it("withdrawPremiumToWallet works even when paused (bought only)", async function () {
       await fundMcgp(mcgp(1000));
-      const cost = await swap.quote(PREMIUM_BUY, mcgp(500));
+      const cost = await swap.quote(PREMIUM_BUY, mcgp(100));
       await usdcToken.connect(alice).approve(await swap.getAddress(), cost);
-      await swap.connect(alice).buyPremium(mcgp(500), cost);
+      await swap.connect(alice).buyPremium(mcgp(100), cost);
       await swap.pause();
-      await expect(swap.connect(alice).buyPremium(mcgp(1), 0)).to.be.revertedWithCustomError(swap, "EnforcedPause");
-      await expect(swap.connect(alice).spend(merchant.address, mcgp(1), refOf("p"))).to.be.revertedWithCustomError(swap, "EnforcedPause");
-      await expect(swap.connect(alice).sellPremium(mcgp(1), 0)).to.be.revertedWithCustomError(swap, "EnforcedPause");
-      await expect(swap.connect(alice).withdrawPremiumToWallet(mcgp(1))).to.emit(swap, "PremiumWithdrawn");
+      await expect(swap.connect(alice).withdrawPremiumToWallet(mcgp(100))).to.emit(swap, "PremiumWithdrawn");
     });
+  });
 
-    it("only owner can seed/fund/withdraw/phase/pause", async function () {
+  describe("Access control", function () {
+    it("only owner can seed/phase/caps/addOperator/addGuardian/fund/withdraw", async function () {
       await expect(swap.connect(alice).seedLegacy([bob.address], [mcgp(1)])).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
-      await expect(swap.connect(alice).addPhase(PREMIUM_BUY, 1, "x")).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
-      await expect(swap.connect(alice).pause()).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
-      await expect(swap.connect(alice).withdraw(await usdcToken.getAddress(), alice.address, 1)).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
+      await expect(swap.connect(alice).setCreditCaps(0, 0, 0, 0)).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
+      await expect(swap.connect(alice).addOperator(bob.address)).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
+      await expect(swap.connect(operator).addOperator(bob.address)).to.be.revertedWithCustomError(swap, "OwnableUnauthorizedAccount");
     });
   });
 });
